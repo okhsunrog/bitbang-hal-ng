@@ -64,7 +64,7 @@ issue in the github project.
 
 ## License
 
-Licensed under MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+Licensed under MIT license ([LICENSE](LICENSE) or http://opensource.org/licenses/MIT)
 
 ### Contributing
 
