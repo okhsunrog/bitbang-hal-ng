@@ -106,7 +106,10 @@ where
     /// SDA is first released while SCL is low so that this sequence is valid
     /// both from the idle state and in the middle of a transaction
     /// (repeated start).
-    fn raw_i2c_start(&mut self) -> Result<(), Error<E>> {
+    ///
+    /// **This is a low-level control function** for not-quite-I2C devices.
+    /// For normal I2C devices, use the [`embedded_hal::i2c::I2c`] trait.
+    pub fn raw_i2c_start(&mut self) -> Result<(), Error<E>> {
         self.set_sda_high()?;
         self.wait_for_clk();
         self.set_scl_high()?;
@@ -119,7 +122,10 @@ where
     }
 
     /// Generate a STOP condition: SDA rises while SCL is high.
-    fn raw_i2c_stop(&mut self) -> Result<(), Error<E>> {
+    ///
+    /// **This is a low-level control function** for not-quite-I2C devices.
+    /// For normal I2C devices, use the [`embedded_hal::i2c::I2c`] trait.
+    pub fn raw_i2c_stop(&mut self) -> Result<(), Error<E>> {
         self.set_sda_low()?;
         self.wait_for_clk();
         self.set_scl_high()?;
@@ -208,6 +214,27 @@ where
             *slot = self.i2c_read_byte(should_send_ack)?;
         }
         Ok(())
+    }
+
+    /// Write raw bytes to the bus, checking the slave's ACK after each byte.
+    /// No START/STOP conditions and no address byte are generated.
+    ///
+    /// **This is a low-level control function** for not-quite-I2C devices.
+    /// For normal I2C devices, use the [`embedded_hal::i2c::I2c`] trait.
+    #[inline]
+    pub fn raw_write_to_slave(&mut self, output: &[u8]) -> Result<(), Error<E>> {
+        self.write_bytes(output)
+    }
+
+    /// Read raw bytes from the bus, ACKing every byte except the last one,
+    /// which is NACKed. No START/STOP conditions and no address byte are
+    /// generated.
+    ///
+    /// **This is a low-level control function** for not-quite-I2C devices.
+    /// For normal I2C devices, use the [`embedded_hal::i2c::I2c`] trait.
+    #[inline]
+    pub fn raw_read_from_slave(&mut self, input: &mut [u8]) -> Result<(), Error<E>> {
+        self.read_bytes(input, true)
     }
 }
 
@@ -392,6 +419,18 @@ mod tests {
         // embedded-hal blanket impl)
         i2c.transaction(0x50, &mut ops).expect("i2c write failed");
         I2c::transaction(&mut &mut i2c, 0x50, &mut ops).expect("i2c write failed");
+    }
+
+    #[test]
+    fn test_raw_slave_access() {
+        let mut i2c = I2cBB::new(DummyPin, DummyPin, DummyDelay, 100_000);
+        // DummyPin reads low, so ACK checks pass and read bytes are zero
+        i2c.raw_i2c_start().expect("start failed");
+        i2c.raw_write_to_slave(&[0xDE, 0xAD]).expect("write failed");
+        let mut buf = [0xFFu8; 2];
+        i2c.raw_read_from_slave(&mut buf).expect("read failed");
+        i2c.raw_i2c_stop().expect("stop failed");
+        assert_eq!(buf, [0, 0]);
     }
 
     #[test]
