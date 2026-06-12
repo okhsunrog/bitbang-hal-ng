@@ -1,24 +1,33 @@
 //! Serial Peripheral Interface
 //!
 //! This implementation consumes the following hardware resources:
-//! - Periodic timer to mark clock cycles
+//! - A delay provider (implements [`embedded_hal::delay::DelayNs`]) for timing clock cycles
 //! - Output GPIO pin for clock signal (SCLK)
 //! - Output GPIO pin for data transmission (Master Output Slave Input - MOSI)
 //! - Input GPIO pin for data reception (Master Input Slave Output - MISO)
 //!
-//! The timer must be configured to twice the desired communication frequency.
+//! SS/CS (slave select) must be handled independently. To get an
+//! [`embedded_hal::spi::SpiDevice`] (manages CS for you), wrap this bus with
+//! `embedded_hal_bus::spi::ExclusiveDevice`.
 //!
-//! SS/CS (slave select) must be handled independently.
+//! All four SPI modes and MSB-first/LSB-first bit orders are supported.
 //!
-//! MSB-first and LSB-first bit orders are supported.
+//! ## Example
 //!
+//! ```rust,ignore
+//! use embedded_hal::spi::MODE_1;
+//! use bitbang_hal_ng::spi::{SPI, SpiConfig};
+//!
+//! let config = SpiConfig::new(MODE_1).with_frequency_hz(500_000);
+//! let spi = SPI::new(miso, mosi, sck, delay, config);
+//! ```
 
 use core::cmp::max;
 
 use embedded_hal::{
     delay::DelayNs,
     digital::{InputPin, OutputPin},
-    spi::{ErrorType, Mode, Polarity, SpiBus, MODE_0, MODE_1, MODE_2, MODE_3},
+    spi::{ErrorType, MODE_0, MODE_1, MODE_2, MODE_3, Mode, Polarity, SpiBus},
 };
 
 /// Error type
@@ -26,59 +35,97 @@ use embedded_hal::{
 pub enum Error<E> {
     /// Communication error
     Bus(E),
-    /// Attempted read without input data
-    NoData,
 }
 
 impl<E: core::fmt::Debug> embedded_hal::spi::Error for Error<E> {
     fn kind(&self) -> embedded_hal::spi::ErrorKind {
         match self {
             Error::Bus(_) => embedded_hal::spi::ErrorKind::Other,
-            Error::NoData => embedded_hal::spi::ErrorKind::Other,
         }
     }
 }
 
 /// Transmission bit order
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum BitOrder {
     /// Most significant bit first
+    #[default]
     MSBFirst,
     /// Least significant bit first
     LSBFirst,
 }
 
-impl Default for BitOrder {
-    /// Default bit order: MSB first
-    fn default() -> Self {
-        BitOrder::MSBFirst
-    }
-}
-
-/// Configuration of the SPI Interface
+/// Configuration of the SPI interface.
+///
+/// Built with [`SpiConfig::new`] and the `with_*` builder methods:
+///
+/// ```rust
+/// use embedded_hal::spi::MODE_1;
+/// use bitbang_hal_ng::spi::{SpiConfig, BitOrder};
+///
+/// let config = SpiConfig::new(MODE_1)
+///     .with_frequency_hz(500_000)
+///     .with_bit_order(BitOrder::MSBFirst);
+/// ```
+#[derive(Debug, Clone)]
 pub struct SpiConfig {
     mode: Mode,
     bit_order: BitOrder,
-    /// Value used when still receiving bits from MISO, but not value is available
-    /// in buffer to be written to MOSI. This value is used instead. Usually `0x00``
+    /// Value clocked out on MOSI when the bus is reading more bytes than
+    /// were provided for writing. Usually `0x00`.
     empty_write_value: u8,
-    /// controls the clock speed. `f = 2 / half_period_duration_ns`
+    /// Half of the SCLK period. The resulting clock frequency is
+    /// `f = 1_000_000_000 / (2 * half_period_duration_ns)` (plus GPIO overhead).
     half_period_duration_ns: u32,
 }
 
 impl Default for SpiConfig {
+    /// Mode 0, MSB first, 100 kHz clock
     fn default() -> Self {
-        Self {
-            mode: MODE_0,
-            bit_order: Default::default(),
-            empty_write_value: 0x00,
-            half_period_duration_ns: 10, // 100 kHz.
-        }
+        Self::new(MODE_0)
     }
 }
 
-/// A Full-Duplex SPI implementation, takes 3 pins, and a timer running at 2x
-/// the desired SPI frequency.
+impl SpiConfig {
+    /// Create a configuration with the given SPI mode, MSB-first bit order
+    /// and a 100 kHz clock.
+    pub fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            bit_order: BitOrder::default(),
+            empty_write_value: 0x00,
+            half_period_duration_ns: 5_000, // 100 kHz
+        }
+    }
+
+    /// Set the transmission bit order.
+    pub fn with_bit_order(mut self, bit_order: BitOrder) -> Self {
+        self.bit_order = bit_order;
+        self
+    }
+
+    /// Set the value clocked out on MOSI when reading without write data.
+    pub fn with_empty_write_value(mut self, value: u8) -> Self {
+        self.empty_write_value = value;
+        self
+    }
+
+    /// Set the target clock frequency in Hz.
+    ///
+    /// The actual frequency will be lower due to GPIO and delay overhead.
+    pub fn with_frequency_hz(mut self, frequency_hz: u32) -> Self {
+        self.half_period_duration_ns = 1_000_000_000 / (2 * frequency_hz);
+        self
+    }
+
+    /// Set the half period of the clock signal in nanoseconds directly.
+    pub fn with_half_period_ns(mut self, half_period_ns: u32) -> Self {
+        self.half_period_duration_ns = half_period_ns;
+        self
+    }
+}
+
+/// A Full-Duplex SPI implementation, takes 3 pins and a delay provider.
 pub struct SPI<Miso, Mosi, Sck, Delay>
 where
     Miso: InputPin,
@@ -100,24 +147,18 @@ where
     Sck: OutputPin<Error = E>,
     Delay: DelayNs,
 {
-    /// Create instance
-    pub fn new(
-        mode: Mode,
-        miso: Miso,
-        mosi: Mosi,
-        sck: Sck,
-        delay: Delay,
-        spi_config: SpiConfig,
-    ) -> Self {
+    /// Create an instance. The clock pin is immediately driven to its idle
+    /// level according to the configured mode's polarity.
+    pub fn new(miso: Miso, mosi: Mosi, sck: Sck, delay: Delay, config: SpiConfig) -> Self {
         let mut spi = SPI {
             miso,
             mosi,
             sck,
             delay,
-            config: spi_config,
+            config,
         };
 
-        match mode.polarity {
+        match spi.config.mode.polarity {
             Polarity::IdleLow => spi.sck.set_low(),
             Polarity::IdleHigh => spi.sck.set_high(),
         }
@@ -126,12 +167,12 @@ where
         spi
     }
 
-    /// Set transmission bit order
-    pub fn with_bit_order(&mut self, order: BitOrder) {
-        self.config.bit_order = order;
+    /// Release the pins and delay provider.
+    pub fn free(self) -> (Miso, Mosi, Sck, Delay) {
+        (self.miso, self.mosi, self.sck, self.delay)
     }
 
-    fn read_bit(&mut self, read_val: &mut u8) -> Result<(), crate::spi::Error<E>> {
+    fn read_bit(&mut self, read_val: &mut u8) -> Result<(), Error<E>> {
         let is_miso_high = self.miso.is_high().map_err(Error::Bus)?;
         let shifted_value = *read_val << 1;
         if is_miso_high {
@@ -143,12 +184,12 @@ where
     }
 
     #[inline]
-    fn set_clk_high(&mut self) -> Result<(), crate::spi::Error<E>> {
+    fn set_clk_high(&mut self) -> Result<(), Error<E>> {
         self.sck.set_high().map_err(Error::Bus)
     }
 
     #[inline]
-    fn set_clk_low(&mut self) -> Result<(), crate::spi::Error<E>> {
+    fn set_clk_low(&mut self) -> Result<(), Error<E>> {
         self.sck.set_low().map_err(Error::Bus)
     }
 
@@ -158,7 +199,7 @@ where
     }
 
     #[inline]
-    fn rw_byte(&mut self, clock_out: u8, read_in: &mut u8) -> Result<(), crate::spi::Error<E>> {
+    fn rw_byte(&mut self, clock_out: u8, read_in: &mut u8) -> Result<(), Error<E>> {
         for bit_offset in 0..8 {
             let out_bit = match self.config.bit_order {
                 BitOrder::MSBFirst => (clock_out >> (7 - bit_offset)) & 0b1,
@@ -214,7 +255,7 @@ where
     Delay: DelayNs,
     E: core::fmt::Debug,
 {
-    type Error = crate::spi::Error<E>;
+    type Error = Error<E>;
 }
 
 impl<Miso, Mosi, Sck, Delay, E> SpiBus<u8> for SPI<Miso, Mosi, Sck, Delay>
@@ -234,17 +275,17 @@ where
     }
 
     fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        let mut ignored_write = 0u8;
+        let mut ignored_read = 0u8;
         for byte in words {
-            self.rw_byte(*byte, &mut ignored_write)?;
+            self.rw_byte(*byte, &mut ignored_read)?;
         }
         Ok(())
     }
 
     fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
-        let mut ignored_write = 0u8;
+        let mut ignored_read = 0u8;
         for i in 0..max(read.len(), write.len()) {
-            let read_in_byte = read.get_mut(i).unwrap_or(&mut ignored_write);
+            let read_in_byte = read.get_mut(i).unwrap_or(&mut ignored_read);
             let clock_out_byte = write
                 .get(i)
                 .copied()
@@ -266,7 +307,7 @@ where
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        // we always flush. Nothing to do here.
+        // Every operation is performed synchronously bit by bit. Nothing to do here.
         Ok(())
     }
 }
@@ -361,7 +402,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(MODE_0, miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
         let mut data = [0x00];
         spi.read(&mut data).expect("SPI read failed");
 
@@ -379,7 +420,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(MODE_0, miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
         let data = [0b01010101];
         spi.write(&data).expect("SPI write failed");
 
@@ -387,6 +428,45 @@ mod tests {
         spi.mosi.done();
         spi.sck.done();
         spi.miso.done();
+    }
+
+    #[test]
+    fn test_spi_mode1_transfer() {
+        // MODE_1: clock idles low, data is shifted out on the rising edge
+        // and sampled on the falling edge.
+        let miso = PinMock::new(&input_waveform("11001100"));
+        let mosi = PinMock::new(&output_waveform("10110001"));
+        // Initial idle low + 8 high/low clock pulses
+        let sck = PinMock::new(&output_waveform("01010101010101010"));
+        let delay = MockDelay::new();
+
+        let config = SpiConfig::new(MODE_1).with_frequency_hz(1_000_000);
+        let mut spi = SPI::new(miso, mosi, sck, delay, config);
+        let mut read_data = [0x00];
+        spi.transfer(&mut read_data, &[0b10110001])
+            .expect("SPI transfer failed");
+
+        spi.miso.done();
+        spi.mosi.done();
+        spi.sck.done();
+        assert_eq!(read_data[0], 0b11001100);
+    }
+
+    #[test]
+    fn test_spi_lsb_first_write() {
+        let miso = PinMock::new(&input_waveform("00000000"));
+        // 0b1000_0011 LSB first: 1,1,0,0,0,0,0,1
+        let mosi = PinMock::new(&output_waveform("11000001"));
+        let sck = PinMock::new(&output_waveform("01010101010101010"));
+        let delay = MockDelay::new();
+
+        let config = SpiConfig::new(MODE_0).with_bit_order(BitOrder::LSBFirst);
+        let mut spi = SPI::new(miso, mosi, sck, delay, config);
+        spi.write(&[0b1000_0011]).expect("SPI write failed");
+
+        spi.miso.done();
+        spi.mosi.done();
+        spi.sck.done();
     }
 
     /// Based on https://www.analog.com/en/resources/analog-dialogue/articles/introduction-to-spi-interface.html
@@ -398,7 +478,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(MODE_0, miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
         let mut read_data = [0x00];
         let write_data = [0xA5];
 

@@ -1,11 +1,11 @@
 [package]
-name = "bitbang-hal"
-version = "0.3.3"
-authors = ["Paul Sajna <sajattack@gmail.com>"]
-edition = "2021"
-description = "Implements embedded-hal traits by bitbanging"
+name = "bitbang-hal-ng"
+version = "0.4.0"
+authors = ["Danila Gornushko <me@okhsunrog.dev>", "Paul Sajna <sajattack@gmail.com>"]
+edition = "2024"
+description = "Implements embedded-hal 1.0 traits by bitbanging"
 license = "MIT"
-repository = "https://github.com/sajattack/bitbang-hal"
+repository = "https://github.com/okhsunrog/bitbang-hal"
 readme = "README.md"
 keywords = ["no_std", "embedded", "bitbang", "embedded-hal", "hal"]
 categories = ["embedded", "no-std"]
@@ -19,4 +19,6 @@ default = []
 embedded-io = ["dep:embedded-io"]
 
 [dev-dependencies]
+drv8301-dd = { path = "../drv8301-dd" }
+embedded-hal-bus = "0.3.0"
 embedded-hal-mock = { version = "0.11.1", features = ["eh1"] }

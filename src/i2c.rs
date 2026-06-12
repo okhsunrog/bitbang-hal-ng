@@ -1,8 +1,8 @@
 /*!
-  # Synchronous implementation of embedded-hal 1.0.0 I2C traits based on GPIO bitbang
+  # Synchronous implementation of embedded-hal 1.0 I2C traits based on GPIO bitbang
 
   This implementation consumes the following hardware resources:
-  - A periodic timer to mark clock cycles
+  - A delay provider (implements [`embedded_hal::delay::DelayNs`]) for timing clock cycles
   - Two GPIO pins for SDA and SCL lines.
 
   Note: This implementation does not support I2C clock stretching.
@@ -10,12 +10,13 @@
   ## Hardware requirements
 
   1. Configure GPIO pins as Open-Drain outputs.
-  2. Configure timer frequency to be twice the desired I2C clock frequency.
+  2. The clock frequency is configured at construction time.
 
   ## Example
 
   ```rust,ignore
-    let i2c = bitbang_hal::i2c::I2cBB::new(scl, sda, tmr);
+    // 100 kHz bus
+    let i2c = bitbang_hal_ng::i2c::I2cBB::new(scl, sda, delay, 100_000);
     let mut sensor = Lm75::new(i2c, SlaveAddr::default());
     let temp = sensor.read_temperature().unwrap();
   ```
@@ -32,8 +33,6 @@ pub enum Error<E> {
     Bus(E),
     /// No ack received
     NoAck,
-    /// Invalid input
-    InvalidData,
 }
 
 impl<E: core::fmt::Debug> embedded_hal::i2c::Error for Error<E> {
@@ -43,34 +42,47 @@ impl<E: core::fmt::Debug> embedded_hal::i2c::Error for Error<E> {
             Error::NoAck => embedded_hal::i2c::ErrorKind::NoAcknowledge(
                 embedded_hal::i2c::NoAcknowledgeSource::Unknown,
             ),
-            Error::InvalidData => embedded_hal::i2c::ErrorKind::Other,
         }
     }
 }
 
 /// Bit banging I2C device
-pub struct I2cBB<SCL, SDA, CLK, E>
+pub struct I2cBB<SCL, SDA, Delay, E>
 where
     SCL: OutputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
-    CLK: DelayNs,
+    Delay: DelayNs,
     E: core::fmt::Debug,
 {
     scl: SCL,
     sda: SDA,
-    clk: CLK,
+    delay: Delay,
+    half_period_ns: u32,
 }
 
-impl<SCL, SDA, CLK, E> I2cBB<SCL, SDA, CLK, E>
+impl<SCL, SDA, Delay, E> I2cBB<SCL, SDA, Delay, E>
 where
     SCL: OutputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
-    CLK: DelayNs,
+    Delay: DelayNs,
     E: core::fmt::Debug,
 {
-    /// Create instance
-    pub fn new(scl: SCL, sda: SDA, clk: CLK) -> Self {
-        I2cBB { scl, sda, clk }
+    /// Create an instance with the given clock frequency in Hz (e.g. `100_000`
+    /// for a 100 kHz bus).
+    ///
+    /// The actual frequency will be lower due to GPIO and delay overhead.
+    pub fn new(scl: SCL, sda: SDA, delay: Delay, frequency_hz: u32) -> Self {
+        I2cBB {
+            scl,
+            sda,
+            delay,
+            half_period_ns: 1_000_000_000 / (2 * frequency_hz),
+        }
+    }
+
+    /// Release the pins and delay provider.
+    pub fn free(self) -> (SCL, SDA, Delay) {
+        (self.scl, self.sda, self.delay)
     }
 
     fn set_scl_high(&mut self) -> Result<(), Error<E>> {
@@ -86,12 +98,18 @@ where
         self.sda.set_low().map_err(Error::Bus)
     }
     fn wait_for_clk(&mut self) {
-        self.clk.delay_ns(1);
+        self.delay.delay_ns(self.half_period_ns);
     }
 
+    /// Generate a (repeated) START condition: SDA falls while SCL is high.
+    ///
+    /// SDA is first released while SCL is low so that this sequence is valid
+    /// both from the idle state and in the middle of a transaction
+    /// (repeated start).
     fn raw_i2c_start(&mut self) -> Result<(), Error<E>> {
-        self.set_scl_high()?;
         self.set_sda_high()?;
+        self.wait_for_clk();
+        self.set_scl_high()?;
         self.wait_for_clk();
         self.set_sda_low()?;
         self.wait_for_clk();
@@ -100,7 +118,10 @@ where
         Ok(())
     }
 
+    /// Generate a STOP condition: SDA rises while SCL is high.
     fn raw_i2c_stop(&mut self) -> Result<(), Error<E>> {
+        self.set_sda_low()?;
+        self.wait_for_clk();
         self.set_scl_high()?;
         self.wait_for_clk();
         self.set_sda_high()?;
@@ -177,30 +198,34 @@ where
         Ok(())
     }
 
-    fn read_bytes(&mut self, buffer: &mut [u8]) -> Result<(), Error<E>> {
-        for i in 0..buffer.len() {
-            let should_send_ack = i != (buffer.len() - 1);
-            buffer[i] = self.i2c_read_byte(should_send_ack)?;
+    /// Read bytes from the bus. If `nack_last` is true, the final byte is
+    /// NACKed (end of the read phase); otherwise every byte is ACKed
+    /// (more reads follow in the same transaction).
+    fn read_bytes(&mut self, buffer: &mut [u8], nack_last: bool) -> Result<(), Error<E>> {
+        let len = buffer.len();
+        for (i, slot) in buffer.iter_mut().enumerate() {
+            let should_send_ack = !(nack_last && i == len - 1);
+            *slot = self.i2c_read_byte(should_send_ack)?;
         }
         Ok(())
     }
 }
 
-impl<SCL, SDA, CLK, E> ErrorType for &mut I2cBB<SCL, SDA, CLK, E>
+impl<SCL, SDA, Delay, E> ErrorType for I2cBB<SCL, SDA, Delay, E>
 where
     SCL: OutputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
-    CLK: DelayNs,
+    Delay: DelayNs,
     E: core::fmt::Debug,
 {
     type Error = Error<E>;
 }
 
-impl<SCL, SDA, CLK, E> I2c<u8> for &mut I2cBB<SCL, SDA, CLK, E>
+impl<SCL, SDA, Delay, E> I2c<u8> for I2cBB<SCL, SDA, Delay, E>
 where
     SCL: OutputPin<Error = E>,
     SDA: OutputPin<Error = E> + InputPin<Error = E>,
-    CLK: DelayNs,
+    Delay: DelayNs,
     E: core::fmt::Debug,
 {
     fn transaction(
@@ -212,34 +237,33 @@ where
             return Ok(());
         }
 
-        // Helper to get R/W bit for Operation
         fn is_read(op: &Operation<'_>) -> bool {
             matches!(op, Operation::Read(_))
         }
 
-        let mut first = true;
-        let mut current_type = None;
+        // As per the embedded-hal contract: a (repeated) START + address byte
+        // is only sent when the operation direction changes; consecutive
+        // operations of the same direction are treated as one continuous
+        // data stream.
+        let mut current_type: Option<bool> = None;
 
-        for op in operations.iter_mut() {
-            let op_is_read = is_read(op);
+        for i in 0..operations.len() {
+            let op_is_read = is_read(&operations[i]);
 
-            // Start or repeated start if switching type
-            if first || current_type != Some(op_is_read) {
-                if first {
-                    self.raw_i2c_start()?;
-                    first = false;
-                } else {
-                    self.raw_i2c_start()?; // repeated start
-                }
+            if current_type != Some(op_is_read) {
+                self.raw_i2c_start()?;
                 let rw_bit = if op_is_read { 0x1 } else { 0x0 };
                 self.i2c_write_byte((addr << 1) | rw_bit)?;
                 self.check_ack()?;
                 current_type = Some(op_is_read);
             }
 
-            // Process the current op
-            match op {
-                Operation::Read(buf) => self.read_bytes(buf)?,
+            // NACK only the very last byte of a run of consecutive reads.
+            let next_is_read = operations.get(i + 1).map(is_read);
+            let nack_last = next_is_read != Some(true);
+
+            match &mut operations[i] {
+                Operation::Read(buf) => self.read_bytes(buf, nack_last)?,
                 Operation::Write(buf) => self.write_bytes(buf)?,
             }
         }
@@ -258,8 +282,6 @@ mod tests {
     };
     use std::vec::Vec;
 
-    // No need to implement Debug for MockError; use PinMock without generics.
-
     fn pin_transactions(states: &[PinState]) -> Vec<PinTransaction> {
         states.iter().map(|&s| PinTransaction::set(s)).collect()
     }
@@ -267,18 +289,19 @@ mod tests {
     #[test]
     fn test_raw_i2c_start_and_stop() {
         let scl = PinMock::new(&pin_transactions(&[
-            PinState::High, // set_scl_high
-            PinState::Low,  // set_scl_low
-            PinState::High, // set_scl_high (stop)
+            PinState::High, // start: scl high after sda released
+            PinState::Low,  // start: scl low
+            PinState::High, // stop: scl high
         ]));
         let sda = PinMock::new(&pin_transactions(&[
-            PinState::High, // set_sda_high
-            PinState::Low,  // set_sda_low
-            PinState::High, // set_sda_high (stop)
+            PinState::High, // start: release sda while scl low
+            PinState::Low,  // start: sda falls while scl high (START)
+            PinState::Low,  // stop: ensure sda low while scl low
+            PinState::High, // stop: sda rises while scl high (STOP)
         ]));
-        let clk = MockDelay::new();
+        let delay = MockDelay::new();
 
-        let mut i2c = I2cBB::new(scl, sda, clk);
+        let mut i2c = I2cBB::new(scl, sda, delay, 100_000);
         i2c.raw_i2c_start().expect("start failed");
         i2c.raw_i2c_stop().expect("stop failed");
 
@@ -290,7 +313,7 @@ mod tests {
     fn test_write_and_ack() {
         // 0b10101010
         let scl = PinMock::new(&vec![
-            // Each bit: set_scl_high, set_scl_low, set_sda_low after clock
+            // Each bit: set_scl_high, set_scl_low
             PinTransaction::set(PinState::High), // bit 7 clock high
             PinTransaction::set(PinState::Low),  // bit 7 clock low
             PinTransaction::set(PinState::High), // bit 6 clock high
@@ -327,55 +350,58 @@ mod tests {
             PinTransaction::set(PinState::Low), // 0
             PinTransaction::set(PinState::Low),
         ]);
-        let clk = MockDelay::new();
+        let delay = MockDelay::new();
 
-        let mut i2c = I2cBB::new(scl, sda, clk);
+        let mut i2c = I2cBB::new(scl, sda, delay, 100_000);
         i2c.i2c_write_byte(0b10101010).expect("write failed");
         i2c.scl.done();
         i2c.sda.done();
     }
 
+    #[derive(Debug)]
+    struct DummyPin;
+    impl embedded_hal::digital::ErrorType for DummyPin {
+        type Error = core::convert::Infallible;
+    }
+    impl embedded_hal::digital::OutputPin for DummyPin {
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    impl embedded_hal::digital::InputPin for DummyPin {
+        fn is_high(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+        fn is_low(&mut self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+    struct DummyDelay;
+    impl embedded_hal::delay::DelayNs for DummyDelay {
+        fn delay_ns(&mut self, _ns: u32) {}
+    }
+
     #[test]
     fn test_i2c_trait_write() {
-        // Use dummy pins that do nothing and always succeed.
-        use core::convert::Infallible;
-        struct DummyPin;
-        impl embedded_hal::digital::ErrorType for DummyPin {
-            type Error = Infallible;
-        }
-        impl embedded_hal::digital::OutputPin for DummyPin {
-            fn set_high(
-                &mut self,
-            ) -> Result<(), <Self as embedded_hal::digital::ErrorType>::Error> {
-                Ok(())
-            }
-            fn set_low(&mut self) -> Result<(), <Self as embedded_hal::digital::ErrorType>::Error> {
-                Ok(())
-            }
-        }
-        impl embedded_hal::digital::InputPin for DummyPin {
-            fn is_high(
-                &mut self,
-            ) -> Result<bool, <Self as embedded_hal::digital::ErrorType>::Error> {
-                Ok(false)
-            }
-            fn is_low(
-                &mut self,
-            ) -> Result<bool, <Self as embedded_hal::digital::ErrorType>::Error> {
-                Ok(true)
-            }
-        }
-        struct DummyDelay;
-        impl embedded_hal::delay::DelayNs for DummyDelay {
-            fn delay_ns(&mut self, _ns: u32) {}
-        }
-
-        let scl = DummyPin;
-        let sda = DummyPin;
-        let clk = DummyDelay;
-
-        let mut i2c = I2cBB::new(scl, sda, clk);
+        let mut i2c = I2cBB::new(DummyPin, DummyPin, DummyDelay, 100_000);
         let mut ops = [Operation::Write(&[0xAB])];
+        // I2cBB implements the I2c trait directly (and `&mut I2cBB` via the
+        // embedded-hal blanket impl)
+        i2c.transaction(0x50, &mut ops).expect("i2c write failed");
         I2c::transaction(&mut &mut i2c, 0x50, &mut ops).expect("i2c write failed");
+    }
+
+    #[test]
+    fn test_i2c_write_read() {
+        let mut i2c = I2cBB::new(DummyPin, DummyPin, DummyDelay, 100_000);
+        let mut buf = [0u8; 2];
+        // write followed by read: repeated start in between
+        i2c.write_read(0x50, &[0x01], &mut buf)
+            .expect("write_read failed");
+        // DummyPin always reads low
+        assert_eq!(buf, [0, 0]);
     }
 }
