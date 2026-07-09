@@ -23,6 +23,27 @@ the target frequency / baud rate is set at construction time. Actual bus
 speeds will be lower than the target due to GPIO and delay overhead — bit
 banging is best suited for low-to-medium speed buses.
 
+## Choosing a delay provider
+
+The delay provider decides the *actual* bus speed:
+
+```text
+f_actual ≈ 1 / (2 × (delay resolution + GPIO overhead))
+```
+
+Do **not** reach for a timer-queue delay with a coarse tick: e.g.
+`embassy_time::Delay` at the common `tick-hz-32_768` rounds every wait up to
+a 30.5 µs tick, silently dragging a bus configured for 500 kHz down to
+~16 kHz. Busy-wait providers are the right tool for bus half-periods:
+
+- **`delay::AsmDelay`** (feature `cortex-m`) — counts CPU cycles via
+  `cortex_m::asm::delay`; precise to tens of nanoseconds, no timer needed.
+  `AsmDelay::new(168_000_000)` for a 168 MHz core.
+- **`delay::NoopDelay`** — no waiting at all; the bus runs as fast as the
+  GPIO calls allow (typically hundreds of kHz to a few MHz). Use when the
+  slave's maximum clock is comfortably above that.
+- Any HAL delay that busy-waits with sub-microsecond resolution.
+
 ## Usage
 
 SPI (e.g. for a TI DRV8301 gate driver, which speaks SPI mode 1):

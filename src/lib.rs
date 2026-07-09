@@ -16,6 +16,21 @@
 //!
 //! All implementations are timed with an [`embedded_hal::delay::DelayNs`]
 //! provider; the target frequency / baud rate is set at construction time.
+//!
+//! ## Choosing a delay provider
+//!
+//! The delay provider decides the *actual* bus speed:
+//!
+//! ```text
+//! f_actual ≈ 1 / (2 × (delay resolution + GPIO overhead))
+//! ```
+//!
+//! Timer-queue delays with coarse ticks are a trap: `embassy_time::Delay`
+//! at the common `tick-hz-32_768` rounds every half-period up to 30.5 µs
+//! and silently drags a 500 kHz bus to ~16 kHz. Use a busy-wait provider
+//! instead — [`delay::AsmDelay`] (feature `cortex-m`) counts CPU cycles,
+//! [`delay::NoopDelay`] runs the bus at raw GPIO speed. See [`delay`] for
+//! the full guidance.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
