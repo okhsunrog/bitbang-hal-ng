@@ -33,7 +33,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use bitbang_hal_ng::spi::{SPI, SpiConfig};
 
 let config = SpiConfig::new(MODE_1).with_frequency_hz(500_000);
-let bus = SPI::new(miso, mosi, sck, delay, config);
+let bus = SPI::new(miso, mosi, sck, delay, config).unwrap();
 // SpiDevice with managed CS pin:
 let spi_device = ExclusiveDevice::new(bus, cs, cs_delay).unwrap();
 let mut drv = drv8301_dd::Drv8301::new(spi_device);

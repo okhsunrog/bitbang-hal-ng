@@ -19,7 +19,7 @@
 //! use bitbang_hal_ng::spi::{SPI, SpiConfig};
 //!
 //! let config = SpiConfig::new(MODE_1).with_frequency_hz(500_000);
-//! let spi = SPI::new(miso, mosi, sck, delay, config);
+//! let spi = SPI::new(miso, mosi, sck, delay, config).unwrap();
 //! ```
 
 use core::cmp::max;
@@ -113,7 +113,12 @@ impl SpiConfig {
     /// Set the target clock frequency in Hz.
     ///
     /// The actual frequency will be lower due to GPIO and delay overhead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frequency_hz` is zero.
     pub fn with_frequency_hz(mut self, frequency_hz: u32) -> Self {
+        assert!(frequency_hz > 0, "SPI clock frequency must be non-zero");
         self.half_period_duration_ns = 1_000_000_000 / (2 * frequency_hz);
         self
     }
@@ -149,7 +154,17 @@ where
 {
     /// Create an instance. The clock pin is immediately driven to its idle
     /// level according to the configured mode's polarity.
-    pub fn new(miso: Miso, mosi: Mosi, sck: Sck, delay: Delay, config: SpiConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Fails if driving the clock pin to its idle level fails.
+    pub fn new(
+        miso: Miso,
+        mosi: Mosi,
+        sck: Sck,
+        delay: Delay,
+        config: SpiConfig,
+    ) -> Result<Self, Error<E>> {
         let mut spi = SPI {
             miso,
             mosi,
@@ -162,9 +177,9 @@ where
             Polarity::IdleLow => spi.sck.set_low(),
             Polarity::IdleHigh => spi.sck.set_high(),
         }
-        .unwrap_or(());
+        .map_err(Error::Bus)?;
 
-        spi
+        Ok(spi)
     }
 
     /// Release the pins and delay provider.
@@ -172,13 +187,12 @@ where
         (self.miso, self.mosi, self.sck, self.delay)
     }
 
-    fn read_bit(&mut self, read_val: &mut u8) -> Result<(), Error<E>> {
-        let is_miso_high = self.miso.is_high().map_err(Error::Bus)?;
-        let shifted_value = *read_val << 1;
-        if is_miso_high {
-            *read_val = shifted_value | 1;
-        } else {
-            *read_val = shifted_value;
+    fn read_bit(&mut self, read_val: &mut u8, bit_offset: u8) -> Result<(), Error<E>> {
+        if self.miso.is_high().map_err(Error::Bus)? {
+            *read_val |= match self.config.bit_order {
+                BitOrder::MSBFirst => 1 << (7 - bit_offset),
+                BitOrder::LSBFirst => 1 << bit_offset,
+            };
         }
         Ok(())
     }
@@ -200,6 +214,7 @@ where
 
     #[inline]
     fn rw_byte(&mut self, clock_out: u8, read_in: &mut u8) -> Result<(), Error<E>> {
+        *read_in = 0;
         for bit_offset in 0..8 {
             let out_bit = match self.config.bit_order {
                 BitOrder::MSBFirst => (clock_out >> (7 - bit_offset)) & 0b1,
@@ -216,28 +231,28 @@ where
                 MODE_0 => {
                     self.wait_for_delay();
                     self.set_clk_high()?;
-                    self.read_bit(read_in)?;
+                    self.read_bit(read_in, bit_offset)?;
                     self.wait_for_delay();
                     self.set_clk_low()?;
                 }
                 MODE_1 => {
                     self.set_clk_high()?;
                     self.wait_for_delay();
-                    self.read_bit(read_in)?;
+                    self.read_bit(read_in, bit_offset)?;
                     self.set_clk_low()?;
                     self.wait_for_delay();
                 }
                 MODE_2 => {
                     self.wait_for_delay();
                     self.set_clk_low()?;
-                    self.read_bit(read_in)?;
+                    self.read_bit(read_in, bit_offset)?;
                     self.wait_for_delay();
                     self.set_clk_high()?;
                 }
                 MODE_3 => {
                     self.set_clk_low()?;
                     self.wait_for_delay();
-                    self.read_bit(read_in)?;
+                    self.read_bit(read_in, bit_offset)?;
                     self.set_clk_high()?;
                     self.wait_for_delay();
                 }
@@ -402,7 +417,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default()).unwrap();
         let mut data = [0x00];
         spi.read(&mut data).expect("SPI read failed");
 
@@ -420,7 +435,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default()).unwrap();
         let data = [0b01010101];
         spi.write(&data).expect("SPI write failed");
 
@@ -441,7 +456,7 @@ mod tests {
         let delay = MockDelay::new();
 
         let config = SpiConfig::new(MODE_1).with_frequency_hz(1_000_000);
-        let mut spi = SPI::new(miso, mosi, sck, delay, config);
+        let mut spi = SPI::new(miso, mosi, sck, delay, config).unwrap();
         let mut read_data = [0x00];
         spi.transfer(&mut read_data, &[0b10110001])
             .expect("SPI transfer failed");
@@ -461,12 +476,32 @@ mod tests {
         let delay = MockDelay::new();
 
         let config = SpiConfig::new(MODE_0).with_bit_order(BitOrder::LSBFirst);
-        let mut spi = SPI::new(miso, mosi, sck, delay, config);
+        let mut spi = SPI::new(miso, mosi, sck, delay, config).unwrap();
         spi.write(&[0b1000_0011]).expect("SPI write failed");
 
         spi.miso.done();
         spi.mosi.done();
         spi.sck.done();
+    }
+
+    #[test]
+    fn test_spi_lsb_first_read() {
+        // 0b1000_0011 LSB first on the wire: 1,1,0,0,0,0,0,1
+        let miso = PinMock::new(&input_waveform("11000001"));
+        // write default value (0x00) to mosi
+        let mosi = PinMock::new(&output_waveform("00000000"));
+        let sck = PinMock::new(&output_waveform("01010101010101010"));
+        let delay = MockDelay::new();
+
+        let config = SpiConfig::new(MODE_0).with_bit_order(BitOrder::LSBFirst);
+        let mut spi = SPI::new(miso, mosi, sck, delay, config).unwrap();
+        let mut data = [0x00];
+        spi.read(&mut data).expect("SPI read failed");
+
+        spi.miso.done();
+        spi.mosi.done();
+        spi.sck.done();
+        assert_eq!(data[0], 0b1000_0011);
     }
 
     /// Based on https://www.analog.com/en/resources/analog-dialogue/articles/introduction-to-spi-interface.html
@@ -478,7 +513,7 @@ mod tests {
         let sck = PinMock::new(&output_waveform("01010101010101010"));
         let delay = MockDelay::new();
 
-        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default());
+        let mut spi = SPI::new(miso, mosi, sck, delay, SpiConfig::default()).unwrap();
         let mut read_data = [0x00];
         let write_data = [0xA5];
 

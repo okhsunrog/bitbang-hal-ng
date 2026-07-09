@@ -97,7 +97,8 @@ fn drv8301_get_device_id_over_bitbang_spi() {
         sck.clone(),
         NoopDelay::new(),
         config,
-    );
+    )
+    .expect("failed to create SPI bus");
     let spi_device = ExclusiveDevice::new(bus, cs.clone(), NoopDelay::new()).unwrap();
 
     let mut drv = Drv8301::new(spi_device);
