@@ -10,11 +10,14 @@
 //! The baud rate is configured at construction time. With the `embedded-io`
 //! feature enabled, the [`embedded_io::Read`] and [`embedded_io::Write`]
 //! traits are implemented on top of the inherent [`Serial::read_byte`] and
-//! [`Serial::write_byte`] methods.
+//! [`Serial::write_byte`] methods. Per the `embedded_io` contract,
+//! [`embedded_io::Read::read`] blocks only until one byte has been received
+//! and then returns, rather than waiting to fill the whole buffer.
 //!
 //! Note: reception is blocking and starts by busy-waiting for a start bit.
 //! Accurate timing depends on the delay provider; at high baud rates GPIO
-//! and delay overhead will dominate.
+//! and delay overhead will dominate. A stop bit that samples low is
+//! reported as [`Error::FrameFormat`].
 
 use embedded_hal::{
     delay::DelayNs,
@@ -26,6 +29,9 @@ use embedded_hal::{
 pub enum Error<E> {
     /// Bus error
     Bus(E),
+    /// The stop bit sampled low: the line is not idle where the frame should
+    /// end (baud-rate mismatch or line noise).
+    FrameFormat,
 }
 
 /// Bit banging serial communication (UART) device
@@ -48,7 +54,12 @@ where
     Delay: DelayNs,
 {
     /// Create an instance with the given baud rate (e.g. `9600`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `baud_rate` is zero.
     pub fn new(tx: TX, rx: RX, delay: Delay, baud_rate: u32) -> Self {
+        assert!(baud_rate > 0, "baud rate must be non-zero");
         Serial {
             tx,
             rx,
@@ -90,7 +101,8 @@ where
     /// Receive a single byte (blocking).
     ///
     /// Busy-waits for a start bit, then samples each data bit at its
-    /// mid-point.
+    /// mid-point. Returns [`Error::FrameFormat`] if the stop bit samples
+    /// low.
     pub fn read_byte(&mut self) -> Result<u8, Error<E>> {
         let mut data_in = 0u8;
 
@@ -110,9 +122,12 @@ where
             self.wait_bit();
         }
 
-        // we are now in the middle of the stop bit; let the caller return
-        // while it plays out so back-to-back reads do not miss the next
-        // start bit
+        // we are now in the middle of the stop bit; sample it to detect
+        // framing errors, then let the rest play out while the caller
+        // returns so back-to-back reads do not miss the next start bit
+        if !self.rx.is_high().map_err(Error::Bus)? {
+            return Err(Error::FrameFormat);
+        }
         Ok(data_in)
     }
 }
@@ -120,7 +135,10 @@ where
 #[cfg(feature = "embedded-io")]
 impl<E: core::fmt::Debug> embedded_io::Error for Error<E> {
     fn kind(&self) -> embedded_io::ErrorKind {
-        embedded_io::ErrorKind::Other
+        match self {
+            Error::Bus(_) => embedded_io::ErrorKind::Other,
+            Error::FrameFormat => embedded_io::ErrorKind::InvalidData,
+        }
     }
 }
 
@@ -144,10 +162,14 @@ where
     E: core::fmt::Debug,
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        for slot in buf.iter_mut() {
-            *slot = self.read_byte()?;
-        }
-        Ok(buf.len())
+        // The embedded_io contract is to block only until some data is
+        // available, not until the buffer is full. A bitbang UART cannot
+        // detect pending data without blocking, so read exactly one byte.
+        let Some(slot) = buf.first_mut() else {
+            return Ok(0);
+        };
+        *slot = self.read_byte()?;
+        Ok(1)
     }
 }
 
@@ -201,7 +223,7 @@ mod tests {
     }
 
     /// RX pin reads for a byte: one read for the start-bit busy-wait,
-    /// then 8 data bit samples (LSB first).
+    /// 8 data bit samples (LSB first), then the stop bit sample.
     fn rx_waveform(byte: u8) -> Vec<PinTransaction> {
         let mut transactions = Vec::new();
         transactions.push(PinTransaction::get(PinState::Low)); // start bit detected
@@ -215,6 +237,7 @@ mod tests {
             transactions.push(PinTransaction::get(state));
             data >>= 1;
         }
+        transactions.push(PinTransaction::get(PinState::High)); // stop bit
         transactions
     }
 
@@ -266,10 +289,35 @@ mod tests {
         let written = serial.write(&bytes).expect("write failed");
         assert_eq!(written, 2);
 
+        // embedded_io::Read returns after one byte, so two calls are needed
         let mut buf = [0u8; 2];
         let read = serial.read(&mut buf).expect("read failed");
-        assert_eq!(read, 2);
+        assert_eq!(read, 1);
+        let read = serial.read(&mut buf[1..]).expect("read failed");
+        assert_eq!(read, 1);
         assert_eq!(buf, bytes);
+
+        // empty buffer returns immediately without touching the pins
+        assert_eq!(serial.read(&mut []).expect("empty read failed"), 0);
+
+        serial.tx.done();
+        serial.rx.done();
+    }
+
+    #[test]
+    fn test_serial_framing_error() {
+        let byte = 0b0101_0101;
+        let mut transactions = rx_waveform(byte);
+        // corrupt the stop bit
+        transactions.pop();
+        transactions.push(PinTransaction::get(PinState::Low));
+
+        let tx = PinMock::new(&[]);
+        let rx = PinMock::new(&transactions);
+        let delay = MockDelay::new();
+
+        let mut serial = Serial::new(tx, rx, delay, 9600);
+        assert!(matches!(serial.read_byte(), Err(Error::FrameFormat)));
 
         serial.tx.done();
         serial.rx.done();
