@@ -71,7 +71,12 @@ where
     /// for a 100 kHz bus).
     ///
     /// The actual frequency will be lower due to GPIO and delay overhead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frequency_hz` is zero.
     pub fn new(scl: SCL, sda: SDA, delay: Delay, frequency_hz: u32) -> Self {
+        assert!(frequency_hz > 0, "I2C clock frequency must be non-zero");
         I2cBB {
             scl,
             sda,
@@ -99,6 +104,14 @@ where
     }
     fn wait_for_clk(&mut self) {
         self.delay.delay_ns(self.half_period_ns);
+    }
+    /// Quarter-period wait used as SDA setup/hold time around SCL edges.
+    /// SDA must never change close to an SCL rising edge: with open-drain
+    /// outputs both lines rise slowly through their pull-ups, and an SDA
+    /// transition racing the clock edge can be seen by slaves as a spurious
+    /// START or STOP condition.
+    fn wait_quarter_period(&mut self) {
+        self.delay.delay_ns(self.half_period_ns / 2);
     }
 
     /// Generate a (repeated) START condition: SDA falls while SCL is high.
@@ -136,13 +149,13 @@ where
     }
 
     fn i2c_is_ack(&mut self) -> Result<bool, Error<E>> {
-        self.set_sda_high()?;
+        self.set_sda_high()?; // release SDA so the slave can drive the ACK
+        self.wait_quarter_period();
         self.set_scl_high()?;
         self.wait_for_clk();
         let ack = self.sda.is_low().map_err(Error::Bus)?;
         self.set_scl_low()?;
-        self.set_sda_low()?;
-        self.wait_for_clk();
+        self.wait_quarter_period();
         Ok(ack)
     }
 
@@ -154,18 +167,19 @@ where
             } else {
                 self.set_sda_low()?;
             }
+            self.wait_quarter_period();
             self.set_scl_high()?;
             self.wait_for_clk();
             self.set_scl_low()?;
-            self.set_sda_low()?;
-            self.wait_for_clk();
+            self.wait_quarter_period();
         }
         Ok(())
     }
 
     fn i2c_read_byte(&mut self, should_send_ack: bool) -> Result<u8, Error<E>> {
         let mut byte: u8 = 0;
-        self.set_sda_high()?;
+        self.set_sda_high()?; // release SDA so the slave can drive data
+        self.wait_quarter_period();
         for bit_offset in 0..8 {
             self.set_scl_high()?;
             self.wait_for_clk();
@@ -180,11 +194,11 @@ where
         } else {
             self.set_sda_high()?;
         }
+        self.wait_quarter_period();
         self.set_scl_high()?;
         self.wait_for_clk();
         self.set_scl_low()?;
-        self.set_sda_low()?;
-        self.wait_for_clk();
+        self.wait_quarter_period();
         Ok(byte)
     }
 
@@ -236,6 +250,71 @@ where
     pub fn raw_read_from_slave(&mut self, input: &mut [u8]) -> Result<(), Error<E>> {
         self.read_bytes(input, true)
     }
+
+    /// Body of [`I2c::transaction`], without the trailing STOP condition.
+    fn execute_operations(
+        &mut self,
+        addr: u8,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), Error<E>> {
+        fn is_read(op: &Operation<'_>) -> bool {
+            matches!(op, Operation::Read(_))
+        }
+        fn is_empty(op: &Operation<'_>) -> bool {
+            match op {
+                Operation::Read(buf) => buf.is_empty(),
+                Operation::Write(buf) => buf.is_empty(),
+            }
+        }
+
+        // As per the embedded-hal contract: a (repeated) START + address byte
+        // is only sent when the operation direction changes; consecutive
+        // operations of the same direction are treated as one continuous
+        // data stream.
+        let mut current_type: Option<bool> = None;
+
+        for i in 0..operations.len() {
+            let op_is_read = is_read(&operations[i]);
+
+            if current_type != Some(op_is_read) {
+                self.raw_i2c_start()?;
+                let rw_bit = if op_is_read { 0x1 } else { 0x0 };
+                self.i2c_write_byte((addr << 1) | rw_bit)?;
+                self.check_ack()?;
+                current_type = Some(op_is_read);
+
+                // Once addressed for read, the slave starts driving data, so
+                // at least one byte must be clocked out and NACKed before the
+                // bus can be released. If every read in this run has an empty
+                // buffer, read and discard a dummy byte.
+                if op_is_read {
+                    let run_is_empty = operations[i..]
+                        .iter()
+                        .take_while(|op| is_read(op))
+                        .all(is_empty);
+                    if run_is_empty {
+                        self.i2c_read_byte(false)?;
+                    }
+                }
+            }
+
+            // NACK only the very last byte actually read in a run of
+            // consecutive reads, i.e. when no later read in the same run
+            // still has data to receive (empty buffers don't count).
+            let more_read_data_follows = operations[i + 1..]
+                .iter()
+                .take_while(|op| is_read(op))
+                .any(|op| !is_empty(op));
+            let nack_last = !more_read_data_follows;
+
+            match &mut operations[i] {
+                Operation::Read(buf) => self.read_bytes(buf, nack_last)?,
+                Operation::Write(buf) => self.write_bytes(buf)?,
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<SCL, SDA, Delay, E> ErrorType for I2cBB<SCL, SDA, Delay, E>
@@ -264,38 +343,11 @@ where
             return Ok(());
         }
 
-        fn is_read(op: &Operation<'_>) -> bool {
-            matches!(op, Operation::Read(_))
-        }
-
-        // As per the embedded-hal contract: a (repeated) START + address byte
-        // is only sent when the operation direction changes; consecutive
-        // operations of the same direction are treated as one continuous
-        // data stream.
-        let mut current_type: Option<bool> = None;
-
-        for i in 0..operations.len() {
-            let op_is_read = is_read(&operations[i]);
-
-            if current_type != Some(op_is_read) {
-                self.raw_i2c_start()?;
-                let rw_bit = if op_is_read { 0x1 } else { 0x0 };
-                self.i2c_write_byte((addr << 1) | rw_bit)?;
-                self.check_ack()?;
-                current_type = Some(op_is_read);
-            }
-
-            // NACK only the very last byte of a run of consecutive reads.
-            let next_is_read = operations.get(i + 1).map(is_read);
-            let nack_last = next_is_read != Some(true);
-
-            match &mut operations[i] {
-                Operation::Read(buf) => self.read_bytes(buf, nack_last)?,
-                Operation::Write(buf) => self.write_bytes(buf)?,
-            }
-        }
-
-        self.raw_i2c_stop()
+        let result = self.execute_operations(addr, operations);
+        // Always send STOP so the bus is released even when an operation
+        // failed mid-transaction; the operation error takes precedence.
+        let stop_result = self.raw_i2c_stop();
+        result.and(stop_result)
     }
 }
 
@@ -358,25 +410,17 @@ mod tests {
             PinTransaction::set(PinState::High), // bit 0 clock high
             PinTransaction::set(PinState::Low),  // bit 0 clock low
         ]);
-        let sda = PinMock::new(&vec![
-            // Each bit: set_sda_high/low, set_sda_low after clock
-            PinTransaction::set(PinState::High), // 1
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::Low), // 0
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::High), // 1
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::Low), // 0
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::High), // 1
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::Low), // 0
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::High), // 1
-            PinTransaction::set(PinState::Low),
-            PinTransaction::set(PinState::Low), // 0
-            PinTransaction::set(PinState::Low),
-        ]);
+        let sda = PinMock::new(&pin_transactions(&[
+            // One set_sda per bit, MSB first
+            PinState::High, // 1
+            PinState::Low,  // 0
+            PinState::High, // 1
+            PinState::Low,  // 0
+            PinState::High, // 1
+            PinState::Low,  // 0
+            PinState::High, // 1
+            PinState::Low,  // 0
+        ]));
         let delay = MockDelay::new();
 
         let mut i2c = I2cBB::new(scl, sda, delay, 100_000);
@@ -430,6 +474,28 @@ mod tests {
         let mut buf = [0xFFu8; 2];
         i2c.raw_read_from_slave(&mut buf).expect("read failed");
         i2c.raw_i2c_stop().expect("stop failed");
+        assert_eq!(buf, [0, 0]);
+    }
+
+    #[test]
+    fn test_i2c_empty_operations() {
+        let mut i2c = I2cBB::new(DummyPin, DummyPin, DummyDelay, 100_000);
+
+        // Probe-style empty write: START + address only
+        i2c.transaction(0x50, &mut [Operation::Write(&[])])
+            .expect("empty write failed");
+
+        // Lone empty read: a dummy byte must be read and NACKed
+        i2c.transaction(0x50, &mut [Operation::Read(&mut [])])
+            .expect("empty read failed");
+
+        // Trailing empty read must not steal the NACK from the last byte
+        // actually read
+        let mut buf = [0xFFu8; 2];
+        let mut empty: [u8; 0] = [];
+        let mut ops = [Operation::Read(&mut buf), Operation::Read(&mut empty)];
+        i2c.transaction(0x50, &mut ops)
+            .expect("read + empty failed");
         assert_eq!(buf, [0, 0]);
     }
 
