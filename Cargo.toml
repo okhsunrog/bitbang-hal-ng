@@ -13,10 +13,13 @@ categories = ["embedded", "no-std"]
 [dependencies]
 embedded-hal = "1.0"
 embedded-io = { version = "0.6.1", optional = true }
+cortex-m = { version = "0.7", optional = true }
 
 [features]
 default = []
 embedded-io = ["dep:embedded-io"]
+# Cycle-counting AsmDelay provider (delay::AsmDelay) for Cortex-M targets.
+cortex-m = ["dep:cortex-m"]
 
 [dev-dependencies]
 drv8301-dd = "0.2"

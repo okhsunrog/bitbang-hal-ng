@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
+pub mod delay;
 pub mod i2c;
 pub mod serial;
 pub mod spi;
